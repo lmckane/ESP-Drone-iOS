@@ -165,6 +165,7 @@ final class ViewModel {
             break
         case .connected:
             progress = 1
+            topButtonTitle = "Disconnect"
             break
         }
     }

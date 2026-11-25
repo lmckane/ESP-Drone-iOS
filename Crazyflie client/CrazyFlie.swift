@@ -54,7 +54,10 @@ open class CrazyFlie: NSObject {
     
         crtpDriver?.onStateUpdated{[weak self] (state) in
             if state.isEqual(to: "idle") {
+                self?.stopTimer()
                 self?.state = .idle
+            } else if state.isEqual(to: "connecting") {
+                self?.state = .connecting
             } else if state.isEqual(to: "connected") {
                 self?.state = .connected
             }
@@ -74,8 +77,8 @@ open class CrazyFlie: NSObject {
                 var body:String?
                 
                 // Find the reason and prepare a message
-                title = "Network Error"
-                body = "The network is not connected"
+                title = "Drone Connection Failed"
+                body = self?.crtpDriver.connectionError ?? "Could not connect to ESP Drone."
                 
                 self?.delegate?.didFail(with: title, message: body)
                 return

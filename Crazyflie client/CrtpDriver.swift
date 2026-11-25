@@ -9,6 +9,7 @@
 import UIKit
 
 protocol CrtpDriver: class {
+    var connectionError: String? { get }
     func connect(_ address: String?, callback: @escaping (Bool) -> ())
     func disconnect()
     func sendPacket(_ packet: Data, callback: ((Bool) -> ())?)

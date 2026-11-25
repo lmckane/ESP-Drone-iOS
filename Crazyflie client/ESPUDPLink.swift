@@ -6,97 +6,131 @@
 //  Copyright © 2020 Bitcraze. All rights reserved.
 //
 
-import UIKit
+import Foundation
 import CocoaAsyncSocket
-import AFNetworking
 
 class ESPUDPLink: NSObject, CrtpDriver, GCDAsyncUdpSocketDelegate {
-
-    var clientSocket: GCDAsyncUdpSocket = GCDAsyncUdpSocket()
-    var mainQueue = DispatchQueue.main
-    var udpError: String?
-    let appPort:UInt16 = 2399
-    let devicePort:UInt16 = 2390
-    let udpHost = "192.168.43.42"
-    var stateCallback: ((NSString) -> ())?
-    fileprivate var connectCallback: ((Bool) -> ())?
-    fileprivate var state = "idle" {
-        didSet {
-            stateCallback?(state as NSString)
-        }
+    private let appPort: UInt16 = 2399
+    private let devicePort: UInt16 = 2390
+    private let udpHost = "192.168.43.42"
+    private let echoHeader: UInt8 = 0xF0 // CRTP link port 15, channel 0
+    private var clientSocket: GCDAsyncUdpSocket!
+    private var receiving = false
+    private var retryTimer: Timer?
+    private var timeoutTimer: Timer?
+    private var echoPayload: Data?
+    private var connectCallback: ((Bool) -> ())?
+    private var stateCallback: ((NSString) -> ())?
+    private(set) var connectionError: String?
+    private var state = "idle" {
+        didSet { stateCallback?(state as NSString) }
     }
+
     override init() {
         super.init()
-        clientSocket = GCDAsyncUdpSocket(delegate: self, delegateQueue: mainQueue)
+        clientSocket = GCDAsyncUdpSocket(delegate: self, delegateQueue: DispatchQueue.main)
+    }
+
+    func connect(_ address: String?, callback: @escaping (Bool) -> ()) {
+        guard state == "idle", connectCallback == nil else {
+            callback(false)
+            return
+        }
+
+        connectionError = nil
+        connectCallback = callback
+        state = "connecting"
         do {
-            try clientSocket.enableBroadcast(true)
-            try clientSocket.bind(toPort: appPort, interface: udpError)
-            if (udpError != nil) {
-                print("error: \(String(describing: udpError))")
-            } else {
+            if !receiving {
+                try clientSocket.bind(toPort: appPort)
                 try clientSocket.beginReceiving()
+                receiving = true
             }
         } catch {
-            print("catch:\(String(describing: udpError))")
+            clientSocket.close()
+            finishConnection(false, error: "Could not open UDP port \(appPort): \(error.localizedDescription)")
+            return
         }
-        state = "idle"
+
+        // A fresh challenge distinguishes this attempt from an old reply.
+        echoPayload = Data((0..<4).map { _ in UInt8.random(in: 0...255) })
+        sendEcho()
+        retryTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in
+            self?.sendEcho()
+        }
+        timeoutTimer = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: false) { [weak self] _ in
+            self?.finishConnection(false, error: "No reply from ESP Drone at 192.168.43.42:2390. Join its ESP-DRONE Wi-Fi and allow Local Network access in Settings.")
+        }
     }
+
+    private func sendEcho() {
+        guard let payload = echoPayload else { return }
+        var packet = Data([echoHeader])
+        packet.append(payload)
+        packet.append(UInt8(packet.reduce(0) { ($0 + Int($1)) & 0xff }))
+        clientSocket.send(packet, toHost: udpHost, port: devicePort, withTimeout: 1, tag: 1)
+    }
+
     func udpSocket(_ sock: GCDAsyncUdpSocket, didReceive data: Data, fromAddress address: Data, withFilterContext filterContext: Any?) {
-        let recv = NSString(data: data, encoding: String.Encoding.utf8.rawValue)
-        let showStr: NSMutableString = NSMutableString()
-        showStr.append(recv! as String)
-        showStr.append("\n")
-        print("didReceive: \(String(describing: recv))")
+        guard let payload = echoPayload, data.count == payload.count + 2 else { return }
+        let bytes = [UInt8](data)
+        let checksum = UInt8(bytes.dropLast().reduce(0) { ($0 + Int($1)) & 0xff })
+        guard checksum == bytes[bytes.count - 1],
+              (bytes[0] & 0xF3) == echoHeader,
+              Data(bytes[1..<(bytes.count - 1)]) == payload,
+              GCDAsyncUdpSocket.host(fromAddress: address) == udpHost,
+              GCDAsyncUdpSocket.port(fromAddress: address) == devicePort else { return }
+        finishConnection(true, error: nil)
     }
-    func udpSocket(_ sock: GCDAsyncUdpSocket, didNotConnect error: Error?) {
-        print("Connection failed: \(String(describing: error))")
-    }
-    func udpSocket(_ sock: GCDAsyncUdpSocket, didSendDataWithTag tag: Int) {
-        print("Data has been sent: \(tag)")
-    }
-    func udpSocketDidClose(_ sock: GCDAsyncUdpSocket, withError error: Error?) {
-        print("Disconnect error: \(String(describing: error))")
-    }
-    func udpSocket(_ sock: GCDAsyncUdpSocket, didConnectToAddress address: Data) {
-        print("Start connecting")
-    }
-    func connect(_ address: String?, callback: @escaping (Bool) -> ()) {
-        print("ESPUDPLink connect")
-        //网络状态消息监听
-        NotificationCenter.default.addObserver(self, selector: #selector(sendWifiStatus), name: NSNotification.Name.AFNetworkingReachabilityDidChange, object: nil)
-        //开启网络状态消息监听
-        AFNetworkReachabilityManager.shared().startMonitoring()
-        connectCallback = callback
-    }
-    @objc func sendWifiStatus() {
-        if AFNetworkReachabilityManager.shared().isReachable {
-            if AFNetworkReachabilityManager.shared().isReachableViaWiFi {
-                print("Connection Type：WiFi")
-                state = "connected"
-                connectCallback?(true)
-            } else if AFNetworkReachabilityManager.shared().isReachableViaWWAN {
-                print("Connection Type：mobile network")
-                connectCallback?(false)
-            }
-        } else {
-            print("Connection Type：No internet connection")
-            connectCallback?(false)
+
+    func udpSocket(_ sock: GCDAsyncUdpSocket, didNotSendDataWithTag tag: Int, dueToError error: Error?) {
+        if tag == 1 {
+            finishConnection(false, error: "Could not send to ESP Drone: \(error?.localizedDescription ?? "UDP error")")
         }
     }
+
+    func udpSocketDidClose(_ sock: GCDAsyncUdpSocket, withError error: Error?) {
+        receiving = false
+        if connectCallback != nil {
+            finishConnection(false, error: "UDP socket closed: \(error?.localizedDescription ?? "unknown error")")
+        } else if state == "connected" {
+            connectionError = "Connection to ESP Drone closed."
+            state = "idle"
+        }
+    }
+
+    private func finishConnection(_ connected: Bool, error: String?) {
+        guard let callback = connectCallback else { return }
+        retryTimer?.invalidate()
+        timeoutTimer?.invalidate()
+        retryTimer = nil
+        timeoutTimer = nil
+        echoPayload = nil
+        connectCallback = nil
+        connectionError = error
+        state = connected ? "connected" : "idle"
+        callback(connected)
+    }
+
     func disconnect() {
-        print("Remove message notification")
-        state = "idle"
-        //关闭网络状态消息监听
-        AFNetworkReachabilityManager.shared().stopMonitoring()
-        //移除网络状态消息通知
-        NotificationCenter.default.removeObserver(self)
+        retryTimer?.invalidate()
+        timeoutTimer?.invalidate()
+        retryTimer = nil
+        timeoutTimer = nil
+        echoPayload = nil
+        connectCallback = nil
+        if state != "idle" { state = "idle" }
     }
-    
+
     func sendPacket(_ packet: Data, callback: ((Bool) -> ())?) {
-//        print("ESPUDPLink send UDP data: \(packet)")
-        clientSocket.send(packet, toHost: udpHost, port: devicePort, withTimeout: -1, tag: 0)
+        guard state == "connected" else {
+            callback?(false)
+            return
+        }
+        clientSocket.send(packet, toHost: udpHost, port: devicePort, withTimeout: 1, tag: 0)
+        callback?(true)
     }
-    
+
     func onStateUpdated(_ callback: @escaping (NSString) -> ()) {
         stateCallback = callback
     }

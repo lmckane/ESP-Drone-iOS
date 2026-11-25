@@ -8,7 +8,7 @@ Features
 - Can connect and control a ESP-Drone via UDP
 - Choice of control mode and sensitivity
 
-This app requires iOS 10 or higher.
+This app requires iOS 15 or higher.
 
 ## Getting Started
 
